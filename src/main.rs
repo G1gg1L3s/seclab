@@ -1,6 +1,6 @@
 use std::io::{ErrorKind, Write};
 
-use seclab::System;
+use seclab::{System, SystemImage};
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -43,13 +43,16 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let system = match std::fs::File::open(opt.image) {
-        Ok(file) => bincode::deserialize_from(file)?,
+    let system = match std::fs::File::open(&opt.image) {
+        Ok(file) => {
+            let img: SystemImage = bincode::deserialize_from(file)?;
+            img.unpack()
+        }
         Err(err) if err.kind() == ErrorKind::NotFound => System::new(),
         Err(err) => return Err(err.into()),
     };
 
-    let (username, password) = read_credentials()?;
+    let (username, password) = dbg!(read_credentials()?);
 
     let session = system.login(&username, &password)?;
 
@@ -58,6 +61,24 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let handler = session.run(&opt.mountpoint)?;
+
+    let mut line = String::new();
+    loop {
+        std::io::stdin().read_line(&mut line)?;
+        if line.contains("exit") {
+            break;
+        }
+    }
+
     handler.join();
+
+    let image = system
+        .pack()
+        // TODO: proper error handling
+        .map_err(|_| anyhow::anyhow!("there should be no more handlers"))?;
+
+    let file = std::fs::File::create(opt.image)?;
+    bincode::serialize_into(file, &image)?;
+
     Ok(())
 }

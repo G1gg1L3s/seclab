@@ -1,22 +1,30 @@
-use std::ffi::OsString;
+use std::sync::{Arc, Mutex};
 
-use fs::Fs;
-use fuser::BackgroundSession;
+use fs::{Fs, FsSession};
 use serde::{Deserialize, Serialize};
 use user::UserManager;
 
 pub mod fs;
 pub mod user;
 
-pub struct SystemSession {
-    users: UserManager,
-    fs: fs::FsSession,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct System {
+pub struct SystemImage {
     users: UserManager,
     fs: Fs,
+}
+
+impl SystemImage {
+    pub fn unpack(self) -> System {
+        System {
+            users: self.users,
+            fs: Arc::new(Mutex::new(self.fs)),
+        }
+    }
+}
+
+pub struct System {
+    users: UserManager,
+    fs: Arc<Mutex<Fs>>,
 }
 
 impl Default for System {
@@ -26,14 +34,12 @@ impl Default for System {
 }
 
 impl System {
-    pub fn login(self, username: &str, password: &str) -> anyhow::Result<SystemSession> {
+    pub fn login(&self, username: &str, password: &str) -> anyhow::Result<FsSession> {
         let user_id = self.users.login(username, password)?;
 
-        let fs = self.fs.login(user_id);
-        Ok(SystemSession {
-            users: self.users,
-            fs,
-        })
+        let fs = self.fs.clone();
+
+        Ok(FsSession::new(user_id, fs))
     }
 
     pub fn new() -> Self {
@@ -41,24 +47,22 @@ impl System {
         let root_id = users.new_user("root".into(), "".into()).expect("no users");
         Self {
             users,
-            fs: Fs::new(root_id),
+            fs: Arc::new(Mutex::new(Fs::new(root_id))),
         }
     }
 }
 
-impl SystemSession {
-    pub fn logout(self) -> System {
-        let fs = self.fs.logout();
-        System {
-            users: self.users,
-            fs,
+impl System {
+    pub fn pack(self) -> Result<SystemImage, Self> {
+        match Arc::try_unwrap(self.fs) {
+            Ok(fs) => Ok(SystemImage {
+                users: self.users,
+                fs: fs.into_inner().expect("no one is holding a mutex"),
+            }),
+            Err(fs) => Err(Self {
+                users: self.users,
+                fs,
+            }),
         }
-    }
-
-    pub fn run(self, mountpoint: &str) -> anyhow::Result<BackgroundSession> {
-        let name: OsString = "fsname=seclab".into();
-        let auto_unmount: OsString = "auto_unmount".into();
-
-        fuser::spawn_mount(self.fs, mountpoint, &[&name, &auto_unmount]).map_err(Into::into)
     }
 }

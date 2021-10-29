@@ -2,10 +2,11 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     ffi::{OsStr, OsString},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
 };
 
-use fuser::{ReplyCreate, Request, TimeOrNow};
+use fuser::{BackgroundSession, ReplyCreate, Request, TimeOrNow};
 use libc::{EACCES, EEXIST, EFAULT, EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTSUP};
 use serde::{Deserialize, Serialize};
 
@@ -165,50 +166,33 @@ pub struct Fs {
     inode_ctr: u64,
 }
 
-impl Fs {
-    pub fn login(self, user_id: UserId) -> FsSession {
-        FsSession {
-            inodes: self.inodes,
-            inode_ctr: self.inode_ctr,
-            user_id,
-        }
-    }
+pub struct FsSession {
+    user_id: UserId,
+    fs: Arc<Mutex<Fs>>,
+}
 
+impl Fs {
     pub fn new(root_id: UserId) -> Self {
-        let root = Inode::new(InodeKindTag::Dir, root_id, root_id, root_id);
+        let inode = 1;
+        let root = Inode::new(InodeKindTag::Dir, inode, root_id, root_id);
         let mut inodes = HashMap::new();
-        inodes.insert(root_id, root);
+        inodes.insert(inode, root);
 
         Self {
             inode_ctr: 2,
             inodes,
         }
     }
-}
 
-pub struct FsSession {
-    inodes: HashMap<Id, Inode>,
-    inode_ctr: u64,
-    user_id: UserId,
-}
-
-impl FsSession {
-    pub fn logout(self) -> Fs {
-        Fs {
-            inodes: self.inodes,
-            inode_ctr: self.inode_ctr,
-        }
-    }
-
-    fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
-        let parent = self.inodes.get(&parent).ok_or(ENOENT)?;
+    fn lookup_name(&self, uid: UserId, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
+        let parent = self.get_inode_secure(uid, &parent, READ)?;
         let dir = parent.kind.as_dir()?;
         let id = dir.get(name).ok_or(ENOENT)?;
         self.inodes.get(id).ok_or(ENOENT)
     }
 
-    fn read(&self, ino: u64, offset: i64, size: u32) -> Result<&[u8], i32> {
-        let file = self.get_inode_secure(&ino, READ)?;
+    fn read(&self, uid: UserId, ino: u64, offset: i64, size: u32) -> Result<&[u8], i32> {
+        let file = self.get_inode_secure(uid, &ino, READ)?;
         let content = file.kind.as_regular()?;
 
         let start: usize = offset
@@ -221,8 +205,8 @@ impl FsSession {
         Ok(&content[start..end])
     }
 
-    fn read_dir(&self, ino: u64, _fh: u64, _offset: i64) -> Result<&HashMap<OsString, Id>, i32> {
-        let file = self.get_inode_secure(&ino, READ)?;
+    fn read_dir(&self, uid: UserId, ino: u64) -> Result<&HashMap<OsString, Id>, i32> {
+        let file = self.get_inode_secure(uid, &ino, READ)?;
         file.kind.as_dir()
     }
 
@@ -230,9 +214,9 @@ impl FsSession {
         self.inodes.get(inode).ok_or(ENOENT)
     }
 
-    fn get_inode_secure(&self, inode: &Id, mask: u8) -> Result<&Inode, i32> {
+    fn get_inode_secure(&self, uid: UserId, inode: &Id, mask: u8) -> Result<&Inode, i32> {
         let inode = self.inodes.get(inode).ok_or(ENOENT)?;
-        if inode.allowed(self.user_id, mask) {
+        if inode.allowed(uid, mask) {
             Ok(inode)
         } else {
             Err(EACCES)
@@ -243,30 +227,22 @@ impl FsSession {
         self.inodes.get_mut(inode).ok_or(ENOENT)
     }
 
-    fn get_inode_mut_secure(&mut self, inode: &Id, mask: u8) -> Result<&mut Inode, i32> {
+    fn get_inode_mut_secure(
+        &mut self,
+        uid: UserId,
+        inode: &Id,
+        mask: u8,
+    ) -> Result<&mut Inode, i32> {
         let inode = self.inodes.get_mut(inode).ok_or(ENOENT)?;
-        if inode.allowed(self.user_id, mask) {
+        if inode.allowed(uid, mask) {
             Ok(inode)
         } else {
             Err(EACCES)
         }
     }
 
-    pub fn new(user_id: UserId) -> Self {
-        let mut this = Self {
-            inode_ctr: 1,
-            inodes: Default::default(),
-            user_id,
-        };
-
-        let root_id = this.alloc_inode();
-        let root = Inode::new(InodeKindTag::Dir, root_id, root_id, user_id);
-        this.inodes.insert(root_id, root);
-        this
-    }
-
-    fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
-        let inode = self.get_inode_mut_secure(&ino, WRITE)?;
+    fn write(&mut self, uid: UserId, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
+        let inode = self.get_inode_mut_secure(uid, &ino, WRITE)?;
         let file = inode.kind.as_regular_mut()?;
 
         let offset: usize = offset.try_into().map_err(|_| EFAULT)?;
@@ -287,8 +263,8 @@ impl FsSession {
         id
     }
 
-    fn create(&mut self, parent: u64, name: &OsStr, mode: u32) -> Result<&Inode, i32> {
-        let parent_inode = self.get_inode_mut_secure(&parent, WRITE)?;
+    fn create(&mut self, uid: UserId, parent: u64, name: &OsStr, mode: u32) -> Result<&Inode, i32> {
+        let parent_inode = self.get_inode_mut_secure(uid, &parent, WRITE)?;
 
         let dir = parent_inode.kind.as_dir()?;
         if dir.get(name).is_some() {
@@ -307,7 +283,7 @@ impl FsSession {
         };
 
         let ino = self.alloc_inode();
-        let inode = Inode::new(tag, ino, parent, self.user_id);
+        let inode = Inode::new(tag, ino, parent, uid);
 
         self.inodes.insert(ino, inode);
         let parent = self.get_inode_mut(&parent).expect("already checked");
@@ -319,6 +295,7 @@ impl FsSession {
 
     fn set_attr(
         &mut self,
+        uid: UserId,
         ino: u64,
         size: Option<u64>,
         atime: Option<TimeOrNow>,
@@ -333,7 +310,7 @@ impl FsSession {
             }
         }
 
-        let inode = self.get_inode_mut(&ino)?;
+        let inode = self.get_inode_mut_secure(uid, &ino, WRITE)?;
 
         if let Some(new_size) = size {
             let file = inode.kind.as_regular_mut()?;
@@ -354,8 +331,8 @@ impl FsSession {
         Ok(inode)
     }
 
-    fn remove(&mut self, parent: u64, name: &OsStr) -> Result<(), i32> {
-        let parent = self.get_inode_mut_secure(&parent, READ | WRITE)?;
+    fn remove(&mut self, uid: UserId, parent: u64, name: &OsStr) -> Result<(), i32> {
+        let parent = self.get_inode_mut_secure(uid, &parent, READ | WRITE)?;
         let list = parent.kind.as_dir_mut()?;
 
         let file = list.remove(name).ok_or(ENOENT)?;
@@ -365,10 +342,10 @@ impl FsSession {
         Ok(())
     }
 
-    fn check_access(&self, ino: u64, mask: u8) -> Result<(), i32> {
+    fn check_access(&self, uid: UserId, ino: u64, mask: u8) -> Result<(), i32> {
         let inode = self.get_inode(&ino)?;
 
-        if mask == 0 || inode.allowed(self.user_id, mask) {
+        if mask == 0 || inode.allowed(uid, mask) {
             Ok(())
         } else {
             Err(EACCES)
@@ -376,11 +353,28 @@ impl FsSession {
     }
 }
 
+impl FsSession {
+    pub fn new(user_id: UserId, fs: Arc<Mutex<Fs>>) -> Self {
+        Self { user_id, fs }
+    }
+
+    fn lock(&self) -> MutexGuard<Fs> {
+        self.fs.lock().expect("acquiring lock")
+    }
+
+    pub fn run(self, mountpoint: &str) -> anyhow::Result<BackgroundSession> {
+        let name: OsString = "fsname=seclab".into();
+        let auto_unmount: OsString = "auto_unmount".into();
+
+        fuser::spawn_mount(self, mountpoint, &[&name, &auto_unmount]).map_err(Into::into)
+    }
+}
+
 impl fuser::Filesystem for FsSession {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
         log::debug!("LOOKUP parent={}, name={:?}", parent, name);
 
-        match self.lookup_name(parent, name) {
+        match self.lock().lookup_name(self.user_id, parent, name) {
             Ok(inode) => reply.entry(&TTL, &inode.fuser_attr(self.user_id), 0),
             Err(err) => reply.error(err),
         }
@@ -399,7 +393,7 @@ impl fuser::Filesystem for FsSession {
     ) {
         log::debug!("READ ino={}, offset={}, size={}", ino, offset, size);
 
-        match Self::read(self, ino, offset, size) {
+        match self.lock().read(self.user_id, ino, offset, size) {
             Ok(data) => reply.data(data),
             Err(err) => reply.error(err),
         }
@@ -415,7 +409,8 @@ impl fuser::Filesystem for FsSession {
     ) {
         log::debug!("READDIR ino={}, fh={}, offset={}", ino, fh, offset);
 
-        let files = match self.read_dir(ino, fh, offset) {
+        let fs = self.lock();
+        let files = match fs.read_dir(self.user_id, ino) {
             Ok(files) => files,
             Err(err) => {
                 reply.error(err);
@@ -424,7 +419,7 @@ impl fuser::Filesystem for FsSession {
         };
 
         for (i, (name, id)) in files.iter().enumerate().skip(offset as usize) {
-            let inode = match self.get_inode(id) {
+            let inode = match fs.get_inode(id) {
                 Ok(inode) => inode,
                 Err(_) => continue,
             };
@@ -437,7 +432,7 @@ impl fuser::Filesystem for FsSession {
         reply.ok()
     }
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        match self.get_inode(&ino) {
+        match self.lock().get_inode(&ino) {
             Ok(inode) => {
                 let mask = match flags & libc::O_ACCMODE {
                     libc::O_RDONLY => READ,
@@ -459,7 +454,7 @@ impl fuser::Filesystem for FsSession {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
-        match self.get_inode(&ino) {
+        match self.lock().get_inode_secure(self.user_id, &ino, READ) {
             Ok(inode) => reply.attr(&TTL, &inode.fuser_attr(self.user_id)),
             Err(err) => reply.error(err),
         }
@@ -477,7 +472,7 @@ impl fuser::Filesystem for FsSession {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        match self.write(ino, offset, data) {
+        match self.lock().write(self.user_id, ino, offset, data) {
             Ok(size) => reply.written(size),
             Err(err) => reply.error(err),
         }
@@ -505,7 +500,7 @@ impl fuser::Filesystem for FsSession {
 
         let user_id = self.user_id;
 
-        match self.create(parent, name, mode) {
+        match self.lock().create(self.user_id, parent, name, mode) {
             Ok(inode) => reply.created(&TTL, &inode.fuser_attr(user_id), 0, 0, 0),
             Err(err) => reply.error(err),
         }
@@ -558,7 +553,10 @@ impl fuser::Filesystem for FsSession {
 
         let user_id = self.user_id;
 
-        match self.set_attr(ino, size, atime, mtime, ctime, crtime) {
+        match self
+            .lock()
+            .set_attr(self.user_id, ino, size, atime, mtime, ctime, crtime)
+        {
             Ok(inode) => reply.attr(&TTL, &inode.fuser_attr(user_id)),
             Err(err) => reply.error(err),
         }
@@ -575,21 +573,21 @@ impl fuser::Filesystem for FsSession {
     ) {
         let user_id = self.user_id;
         let mode = mode | libc::S_IFDIR;
-        match self.create(parent, name, mode) {
+        match self.lock().create(self.user_id, parent, name, mode) {
             Ok(inode) => reply.entry(&TTL, &inode.fuser_attr(user_id), 0),
             Err(err) => reply.error(err),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        match self.remove(parent, name) {
+        match self.lock().remove(self.user_id, parent, name) {
             Ok(_) => reply.ok(),
             Err(err) => reply.error(err),
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        match self.remove(parent, name) {
+        match self.lock().remove(self.user_id, parent, name) {
             Ok(_) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -610,7 +608,7 @@ impl fuser::Filesystem for FsSession {
             | sieve_mask(libc::W_OK, WRITE)
             | sieve_mask(libc::X_OK, EXEC);
 
-        match self.check_access(ino, mask) {
+        match self.lock().check_access(self.user_id, ino, mask) {
             Ok(_) => reply.ok(),
             Err(err) => reply.error(err),
         }

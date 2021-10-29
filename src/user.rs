@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+const MAX_USER_COUNT: usize = 16;
+
 pub const READ: u8 = 0b001;
 pub const WRITE: u8 = 0b010;
 pub const EXEC: u8 = 0b100;
@@ -87,6 +89,10 @@ impl Permissions {
     pub fn and(&self, mask: u8) -> bool {
         self.0 & mask > 0
     }
+
+    pub fn add(&mut self, rhs: Self) {
+        self.0 |= rhs.0
+    }
 }
 
 pub type Username = String;
@@ -129,6 +135,10 @@ impl UserManager {
     }
 
     pub fn new_user(&mut self, username: Username, password: String) -> anyhow::Result<UserId> {
+        if self.users.len() == MAX_USER_COUNT {
+            anyhow::bail!("Max number of users is already registered");
+        }
+
         if self.users.get(&username).is_some() {
             anyhow::bail!("the user already exists")
         }
@@ -154,6 +164,10 @@ impl UserManager {
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("Wrong username or password"))
+    }
+
+    pub fn get_id_for(&self, user: &str) -> Option<UserId> {
+        self.users.get(user).map(|u| u.id)
     }
 }
 

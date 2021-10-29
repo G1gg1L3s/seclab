@@ -2,10 +2,12 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     ffi::{OsStr, OsString},
+    path::{Component, Path},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
 };
 
+use anyhow::anyhow;
 use fuser::{BackgroundSession, ReplyCreate, Request, TimeOrNow};
 use libc::{EACCES, EEXIST, EFAULT, EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTSUP};
 use serde::{Deserialize, Serialize};
@@ -184,11 +186,23 @@ impl Fs {
         }
     }
 
-    fn lookup_name(&self, uid: UserId, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
+    fn lookup_name_secure(&self, uid: UserId, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
         let parent = self.get_inode_secure(uid, &parent, READ)?;
         let dir = parent.kind.as_dir()?;
         let id = dir.get(name).ok_or(ENOENT)?;
         self.inodes.get(id).ok_or(ENOENT)
+    }
+
+    fn lookup_name(&self, parent: u64, name: &OsStr) -> anyhow::Result<&Inode> {
+        let parent = self
+            .get_inode(&parent)
+            .map_err(|_| anyhow!("File not found"))?;
+        let dir = parent
+            .kind
+            .as_dir()
+            .map_err(|_| anyhow!("File is not a directory"))?;
+        let id = dir.get(name).ok_or_else(|| anyhow!("File not found"))?;
+        self.inodes.get(id).ok_or_else(|| anyhow!("File not found"))
     }
 
     fn read(&self, uid: UserId, ino: u64, offset: i64, size: u32) -> Result<&[u8], i32> {
@@ -351,6 +365,38 @@ impl Fs {
             Err(EACCES)
         }
     }
+
+    pub fn resolve_path(&self, path: &str) -> anyhow::Result<Id> {
+        let segments = Path::new(path).components();
+
+        {
+            dbg!(Path::new(path).components().collect::<Vec<_>>());
+        }
+
+        let mut parent = self.get_inode(&1).expect("where is the root");
+        for segment in segments {
+            let name = match segment {
+                Component::Normal(x) => x,
+                Component::RootDir | Component::CurDir | Component::ParentDir => OsStr::new("."),
+                _ => anyhow::bail!("unsupported path structure"),
+            };
+            let dir = parent
+                .kind
+                .as_dir()
+                .map_err(|_| anyhow!("file is not a directory"))?;
+            let ino = dir.get(name).ok_or_else(|| anyhow!("file not found"))?;
+            parent = self.get_inode(ino).map_err(|_| anyhow!("file not found"))?;
+        }
+        Ok(parent.attr.ino)
+    }
+
+    pub fn add_perm(&mut self, ino: u64, uid: UserId, perm: Permissions) -> anyhow::Result<()> {
+        let inode = self
+            .get_inode_mut(&ino)
+            .map_err(|_| anyhow!("file not found"))?;
+        inode.perm.entry(uid).or_default().add(perm);
+        Ok(())
+    }
 }
 
 impl FsSession {
@@ -374,7 +420,7 @@ impl fuser::Filesystem for FsSession {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
         log::debug!("LOOKUP parent={}, name={:?}", parent, name);
 
-        match self.lock().lookup_name(self.user_id, parent, name) {
+        match self.lock().lookup_name_secure(self.user_id, parent, name) {
             Ok(inode) => reply.entry(&TTL, &inode.fuser_attr(self.user_id), 0),
             Err(err) => reply.error(err),
         }

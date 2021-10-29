@@ -7,6 +7,7 @@ use std::{
 
 use fuser::{ReplyCreate, Request, TimeOrNow};
 use libc::{EACCES, EEXIST, EFAULT, EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTSUP};
+use serde::{Deserialize, Serialize};
 
 use crate::user::{Permissions, UserId, EXEC, READ, WRITE};
 
@@ -32,6 +33,7 @@ impl From<InodeKindTag> for InodeKind {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub enum InodeKind {
     Regular { content: Vec<u8> },
     Dir { list: HashMap<OsString, Id> },
@@ -78,6 +80,7 @@ impl InodeKind {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InodeAttr {
     ino: Id,
     atime: SystemTime,
@@ -86,6 +89,7 @@ pub struct InodeAttr {
     crtime: SystemTime,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Inode {
     kind: InodeKind,
     attr: InodeAttr,
@@ -155,9 +159,31 @@ impl Inode {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Fs {
     inodes: HashMap<Id, Inode>,
     inode_ctr: u64,
+}
+
+impl Fs {
+    pub fn login(self, user_id: UserId) -> FsSession {
+        FsSession {
+            inodes: self.inodes,
+            inode_ctr: self.inode_ctr,
+            user_id,
+        }
+    }
+
+    pub fn new(root_id: UserId) -> Self {
+        let root = Inode::new(InodeKindTag::Dir, root_id, root_id, root_id);
+        let mut inodes = HashMap::new();
+        inodes.insert(root_id, root);
+
+        Self {
+            inode_ctr: 2,
+            inodes,
+        }
+    }
 }
 
 pub struct FsSession {
@@ -167,6 +193,13 @@ pub struct FsSession {
 }
 
 impl FsSession {
+    pub fn logout(self) -> Fs {
+        Fs {
+            inodes: self.inodes,
+            inode_ctr: self.inode_ctr,
+        }
+    }
+
     fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
         let parent = self.inodes.get(&parent).ok_or(ENOENT)?;
         let dir = parent.kind.as_dir()?;

@@ -1,11 +1,36 @@
-use fuser::MountOption;
-use seclab::fs::FsSession;
+use std::io::{ErrorKind, Write};
+
+use seclab::System;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
 struct Opt {
     #[structopt(short, long, default_value = "tmp")]
     mountpoint: String,
+
+    #[structopt(short, long)]
+    image: String,
+}
+
+fn fix_newline(str: &mut String) {
+    if str.ends_with('\n') {
+        str.pop();
+        if str.ends_with('\r') {
+            str.pop();
+        }
+    }
+}
+
+fn read_credentials() -> anyhow::Result<(String, String)> {
+    print!("Username: ");
+    std::io::stdout().flush()?;
+    let mut username = String::new();
+    std::io::stdin().read_line(&mut username)?;
+    print!("Password: ");
+    std::io::stdout().flush()?;
+    let password = rpassword::read_password()?;
+    fix_newline(&mut username);
+    Ok((username, password))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -13,21 +38,26 @@ fn main() -> anyhow::Result<()> {
 
     if let Err(err) = std::fs::create_dir(&opt.mountpoint) {
         match err.kind() {
-            std::io::ErrorKind::AlreadyExists => {}
+            ErrorKind::AlreadyExists => {}
             _ => anyhow::bail!("creating the directory: {}", err),
         }
     };
 
-    let fs = FsSession::new(1);
+    let system = match std::fs::File::open(opt.image) {
+        Ok(file) => bincode::deserialize_from(file)?,
+        Err(err) if err.kind() == ErrorKind::NotFound => System::new(),
+        Err(err) => return Err(err.into()),
+    };
 
-    let options = vec![
-        MountOption::FSName("seclab".to_string()),
-        MountOption::AutoUnmount,
-    ];
+    let (username, password) = read_credentials()?;
+
+    let session = system.login(&username, &password)?;
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Trace)
         .init();
 
-    fuser::mount2(fs, &opt.mountpoint, &options).map_err(Into::into)
+    let handler = session.run(&opt.mountpoint)?;
+    handler.join();
+    Ok(())
 }

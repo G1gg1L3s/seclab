@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 pub const READ: u8 = 0b001;
 pub const WRITE: u8 = 0b010;
 pub const EXEC: u8 = 0b100;
 
 const MASK: u8 = READ | WRITE | EXEC;
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Permissions(u8);
 
 impl std::fmt::Debug for Permissions {
@@ -90,7 +92,7 @@ impl Permissions {
 pub type Username = String;
 
 // TODO: fix debug
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct User {
     id: UserId,
     username: Username,
@@ -115,7 +117,7 @@ impl User {
 
 pub type UserId = u64;
 
-#[derive(Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UserManager {
     user_ctr: UserId,
     users: HashMap<Username, User>,
@@ -126,7 +128,7 @@ impl UserManager {
         Self::default()
     }
 
-    pub fn new_user(&mut self, username: Username, password: String) -> anyhow::Result<()> {
+    pub fn new_user(&mut self, username: Username, password: String) -> anyhow::Result<UserId> {
         if self.users.get(&username).is_some() {
             anyhow::bail!("the user already exists")
         }
@@ -138,14 +140,20 @@ impl UserManager {
             password,
         };
         self.users.insert(username, user);
-        Ok(())
+        Ok(id)
     }
 
-    pub fn login(&self, username: &str, password: &str) -> bool {
+    pub fn login(&self, username: &str, password: &str) -> anyhow::Result<UserId> {
         self.users
             .get(username)
-            .map(|user| user.check_pass(password))
-            .unwrap_or(false)
+            .and_then(|user| {
+                if user.check_pass(password) {
+                    Some(user.id)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!("Wrong username or password"))
     }
 }
 

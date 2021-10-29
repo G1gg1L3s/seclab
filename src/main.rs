@@ -1,5 +1,5 @@
 use fuser::MountOption;
-use seclab::Fs;
+use seclab::fs::FsSession;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let fs = Fs::new_test();
+    let fs = FsSession::new(1);
 
     let options = vec![
         MountOption::FSName("seclab".to_string()),

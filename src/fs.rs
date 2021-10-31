@@ -193,18 +193,6 @@ impl Fs {
         self.inodes.get(id).ok_or(ENOENT)
     }
 
-    fn lookup_name(&self, parent: u64, name: &OsStr) -> anyhow::Result<&Inode> {
-        let parent = self
-            .get_inode(&parent)
-            .map_err(|_| anyhow!("File not found"))?;
-        let dir = parent
-            .kind
-            .as_dir()
-            .map_err(|_| anyhow!("File is not a directory"))?;
-        let id = dir.get(name).ok_or_else(|| anyhow!("File not found"))?;
-        self.inodes.get(id).ok_or_else(|| anyhow!("File not found"))
-    }
-
     fn read(&self, uid: UserId, ino: u64, offset: i64, size: u32) -> Result<&[u8], i32> {
         let file = self.get_inode_secure(uid, &ino, READ)?;
         let content = file.kind.as_regular()?;
@@ -368,10 +356,6 @@ impl Fs {
 
     pub fn resolve_path(&self, path: &str) -> anyhow::Result<Id> {
         let segments = Path::new(path).components();
-
-        {
-            dbg!(Path::new(path).components().collect::<Vec<_>>());
-        }
 
         let mut parent = self.get_inode(&1).expect("where is the root");
         for segment in segments {

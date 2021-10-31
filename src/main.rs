@@ -11,6 +11,9 @@ struct Opt {
 
     #[structopt(short, long)]
     image: String,
+
+    #[structopt(short, long)]
+    debug: bool,
 }
 
 fn fix_newline(str: &mut String) {
@@ -98,9 +101,11 @@ fn main() -> anyhow::Result<()> {
 
     let (mut sys, fs) = system.login(&username, &password)?;
 
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .init();
+    if opt.debug {
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .init();
+    }
 
     let handler = fs.run(&opt.mountpoint)?;
 

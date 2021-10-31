@@ -7,6 +7,7 @@ use user::{UserId, UserManager};
 
 use crate::user::Permissions;
 
+pub mod crypto;
 pub mod fs;
 pub mod user;
 

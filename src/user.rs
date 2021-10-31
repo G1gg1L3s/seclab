@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto;
+
 const MAX_USER_COUNT: usize = 16;
 
 pub const READ: u8 = 0b001;
@@ -102,22 +104,21 @@ pub type Username = String;
 pub struct User {
     id: UserId,
     username: Username,
-    // TODO: change because it's insecure
-    password: String,
+    pass_hash: String,
 }
 
 impl User {
-    pub fn new(id: UserId, username: Username, password: String) -> Self {
-        Self {
+    pub fn new(id: UserId, username: Username, password: &str) -> anyhow::Result<Self> {
+        let pass_hash = crypto::new_password_hash(password)?;
+        Ok(Self {
             id,
             username,
-            password,
-        }
+            pass_hash,
+        })
     }
 
-    pub fn check_pass(&self, pass: &str) -> bool {
-        // TODO: insecure
-        self.password == pass
+    pub fn check_pass(&self, pass: &str) -> anyhow::Result<()> {
+        crypto::verify_password(&self.pass_hash, pass)
     }
 }
 
@@ -144,11 +145,7 @@ impl UserManager {
         }
         let id = self.user_ctr;
         self.user_ctr += 1;
-        let user = User {
-            id,
-            username: username.clone(),
-            password,
-        };
+        let user = User::new(id, username.clone(), &password)?;
         self.users.insert(username, user);
         Ok(id)
     }
@@ -157,7 +154,7 @@ impl UserManager {
         self.users
             .get(username)
             .and_then(|user| {
-                if user.check_pass(password) {
+                if user.check_pass(password).is_ok() {
                     Some(user.id)
                 } else {
                     None

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     ffi::{OsStr, OsString},
+    fmt::{Debug, Display},
     path::{Component, Path},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -10,9 +11,13 @@ use std::{
 use anyhow::anyhow;
 use fuser::{BackgroundSession, ReplyCreate, Request, TimeOrNow};
 use libc::{EACCES, EEXIST, EFAULT, EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTSUP};
+use nix::errno::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::user::{Permissions, UserId, EXEC, READ, WRITE};
+use crate::{
+    log::LogSender,
+    user::{Permissions, UserId, EXEC, READ, WRITE},
+};
 
 const TTL: Duration = Duration::ZERO;
 
@@ -162,8 +167,26 @@ impl Inode {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Fs {
+    inodes: HashMap<Id, Inode>,
+    inode_ctr: u64,
+    logger: LogSender,
+}
+
+impl FsImage {
+    pub fn unpack(self, logger: LogSender) -> Fs {
+        let Self { inode_ctr, inodes } = self;
+        Fs {
+            inodes,
+            inode_ctr,
+            logger,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FsImage {
     inodes: HashMap<Id, Inode>,
     inode_ctr: u64,
 }
@@ -174,7 +197,7 @@ pub struct FsSession {
 }
 
 impl Fs {
-    pub fn new(root_id: UserId) -> Self {
+    pub fn new(root_id: UserId, logger: LogSender) -> Self {
         let inode = 1;
         let root = Inode::new(InodeKindTag::Dir, inode, root_id, root_id);
         let mut inodes = HashMap::new();
@@ -183,7 +206,17 @@ impl Fs {
         Self {
             inode_ctr: 2,
             inodes,
+            logger,
         }
+    }
+
+    pub fn pack(self) -> FsImage {
+        let Self {
+            inodes,
+            inode_ctr,
+            logger: _,
+        } = self;
+        FsImage { inodes, inode_ctr }
     }
 
     fn lookup_name_secure(&self, uid: UserId, parent: u64, name: &OsStr) -> Result<&Inode, i32> {
@@ -400,14 +433,35 @@ impl FsSession {
     }
 }
 
+macro_rules! log_fs {
+    ($fs: expr, $uid: expr, $($arg: tt) *) => {
+        $fs.logger.send(crate::log::Log::new($uid, format!($($arg)*))).expect("can't send the log")
+    };
+}
+
 impl fuser::Filesystem for FsSession {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
-        log::debug!("LOOKUP parent={}, name={:?}", parent, name);
+        let fs = self.lock();
 
-        match self.lock().lookup_name_secure(self.user_id, parent, name) {
-            Ok(inode) => reply.entry(&TTL, &inode.fuser_attr(self.user_id), 0),
-            Err(err) => reply.error(err),
-        }
+        let res = match fs.lookup_name_secure(self.user_id, parent, name) {
+            Ok(inode) => {
+                reply.entry(&TTL, &inode.fuser_attr(self.user_id), 0);
+                format!("Ok(inode={})", inode.attr.ino)
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            self.user_id,
+            "LOOKUP parent={}, name={:?} |> {}",
+            parent,
+            name,
+            res
+        );
     }
 
     fn read(
@@ -421,24 +475,37 @@ impl fuser::Filesystem for FsSession {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        log::debug!("READ ino={}, offset={}, size={}", ino, offset, size);
+        let fs = self.lock();
+        let res = match fs.read(self.user_id, ino, offset, size) {
+            Ok(data) => {
+                reply.data(data);
+                format!("Ok(read={})", data.len())
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
 
-        match self.lock().read(self.user_id, ino, offset, size) {
-            Ok(data) => reply.data(data),
-            Err(err) => reply.error(err),
-        }
+        log_fs!(
+            fs,
+            self.user_id,
+            "READ ino={}, offset={}, size={} |> {}",
+            ino,
+            offset,
+            size,
+            res
+        );
     }
 
     fn readdir(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        log::debug!("READDIR ino={}, fh={}, offset={}", ino, fh, offset);
-
         let fs = self.lock();
         let files = match fs.read_dir(self.user_id, ino) {
             Ok(files) => files,
@@ -462,7 +529,8 @@ impl fuser::Filesystem for FsSession {
         reply.ok()
     }
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        match self.lock().get_inode(&ino) {
+        let fs = self.lock();
+        let res = match fs.get_inode(&ino) {
             Ok(inode) => {
                 let mask = match flags & libc::O_ACCMODE {
                     libc::O_RDONLY => READ,
@@ -474,13 +542,27 @@ impl fuser::Filesystem for FsSession {
                 };
 
                 if inode.allowed(self.user_id, mask) {
-                    reply.opened(0, 0)
+                    reply.opened(0, 0);
+                    "Ok(opened)".to_string()
                 } else {
-                    reply.error(EACCES)
+                    reply.error(EACCES);
+                    Errno::from_i32(EACCES).to_string()
                 }
             }
-            Err(err) => reply.error(err),
-        }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            self.user_id,
+            "OPEN ino={}, flags={:x} |> {}",
+            ino,
+            flags,
+            res
+        );
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
@@ -502,10 +584,27 @@ impl fuser::Filesystem for FsSession {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        match self.lock().write(self.user_id, ino, offset, data) {
-            Ok(size) => reply.written(size),
-            Err(err) => reply.error(err),
-        }
+        let mut fs = self.lock();
+        let res = match fs.write(self.user_id, ino, offset, data) {
+            Ok(size) => {
+                reply.written(size);
+                format!("Ok(written={})", size)
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            self.user_id,
+            "WRITE ino={}, offset={}, size={} |> {}",
+            ino,
+            offset,
+            data.len(),
+            res
+        );
     }
 
     fn create(
@@ -518,22 +617,30 @@ impl fuser::Filesystem for FsSession {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        log::debug!(
-            "CREATE (parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
-            flags: {:#x?})",
+        let user_id = self.user_id;
+        let mut fs = self.lock();
+
+        let res = match fs.create(self.user_id, parent, name, mode) {
+            Ok(inode) => {
+                reply.created(&TTL, &inode.fuser_attr(user_id), 0, 0, 0);
+                format!("Ok(ino={})", inode.attr.ino)
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            user_id,
+            "CREATE parent={}, name={:?}, mode={:o}, flags={:x} |> {}",
             parent,
             name,
             mode,
-            _umask,
-            flags
+            flags,
+            res
         );
-
-        let user_id = self.user_id;
-
-        match self.lock().create(self.user_id, parent, name, mode) {
-            Ok(inode) => reply.created(&TTL, &inode.fuser_attr(user_id), 0, 0, 0),
-            Err(err) => reply.error(err),
-        }
     }
 
     fn setattr(
@@ -554,22 +661,28 @@ impl fuser::Filesystem for FsSession {
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        log::debug!("SETATTR:");
-        log::debug!("\tino={:?}:", ino);
-        log::debug!("\tmode={:?}:", mode);
-        log::debug!("\tuid={:?}:", uid);
-        log::debug!("\tgid={:?}:", gid);
-        log::debug!("\tsize={:?}:", size);
-        log::debug!("\tatime={:?}:", atime);
-        log::debug!("\tmtime={:?}:", mtime);
-        log::debug!("\tctime={:?}:", ctime);
-        log::debug!("\tfh={:?}:", fh);
-        log::debug!("\tcrtime={:?}:", crtime);
-        log::debug!("\tchgtime={:?}:", chgtime);
-        log::debug!("\tbkuptime={:?}:", bkuptime);
-        log::debug!("\tflags={:?}:", flags);
+        use std::fmt::Write;
 
-        if mode.is_some()
+        let mut log = format!(
+            "SETTATTR ino={}{}{}{}{}{:?}{:?}{:?}{}{:?}{:?}{:?}{}",
+            ino,
+            DisplayIfSome("mode", &mode),
+            DisplayIfSome("uid", &uid),
+            DisplayIfSome("gid", &gid),
+            DisplayIfSome("size", &size),
+            DisplayIfSome("atime", &atime),
+            DisplayIfSome("mtime", &mtime),
+            DisplayIfSome("ctime", &ctime),
+            DisplayIfSome("fh", &fh),
+            DisplayIfSome("crtime", &crtime),
+            DisplayIfSome("chgtime", &chgtime),
+            DisplayIfSome("bkuptime", &bkuptime),
+            DisplayIfSome("flags", &flags),
+        );
+
+        let user_id = self.user_id;
+        let mut fs = self.lock();
+        let res = if mode.is_some()
             || uid.is_some()
             || gid.is_some()
             || fh.is_some()
@@ -578,18 +691,23 @@ impl fuser::Filesystem for FsSession {
             || flags.is_some()
         {
             reply.error(ENOTSUP);
-            return;
-        }
+            format!("Err({})", Errno::from_i32(ENOTSUP))
+        } else {
+            match fs.set_attr(self.user_id, ino, size, atime, mtime, ctime, crtime) {
+                Ok(inode) => {
+                    reply.attr(&TTL, &inode.fuser_attr(user_id));
+                    "Ok()".to_string()
+                }
+                Err(err) => {
+                    reply.error(err);
+                    format!("Err({})", Errno::from_i32(err))
+                }
+            }
+        };
 
-        let user_id = self.user_id;
+        write!(log, " |> {}", res).unwrap();
 
-        match self
-            .lock()
-            .set_attr(self.user_id, ino, size, atime, mtime, ctime, crtime)
-        {
-            Ok(inode) => reply.attr(&TTL, &inode.fuser_attr(user_id)),
-            Err(err) => reply.error(err),
-        }
+        log_fs!(fs, user_id, "{}", log);
     }
 
     fn mkdir(
@@ -603,29 +721,76 @@ impl fuser::Filesystem for FsSession {
     ) {
         let user_id = self.user_id;
         let mode = mode | libc::S_IFDIR;
-        match self.lock().create(self.user_id, parent, name, mode) {
-            Ok(inode) => reply.entry(&TTL, &inode.fuser_attr(user_id), 0),
-            Err(err) => reply.error(err),
-        }
+        let mut fs = self.lock();
+        let res = match fs.create(self.user_id, parent, name, mode) {
+            Ok(inode) => {
+                reply.entry(&TTL, &inode.fuser_attr(user_id), 0);
+                format!("Ok(ino={})", inode.attr.ino)
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            user_id,
+            "MKDIR parent={}, name={:?}, mode={:x} |> {}",
+            parent,
+            name,
+            mode,
+            res
+        );
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        match self.lock().remove(self.user_id, parent, name) {
-            Ok(_) => reply.ok(),
-            Err(err) => reply.error(err),
-        }
+        let mut fs = self.lock();
+        let res = match fs.remove(self.user_id, parent, name) {
+            Ok(_) => {
+                reply.ok();
+                "Ok()".to_string()
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            self.user_id,
+            "UNLINK parent={}, name={:?} |> {}",
+            parent,
+            name,
+            res
+        );
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        match self.lock().remove(self.user_id, parent, name) {
-            Ok(_) => reply.ok(),
-            Err(err) => reply.error(err),
-        }
+        let mut fs = self.lock();
+        let res = match fs.remove(self.user_id, parent, name) {
+            Ok(_) => {
+                reply.ok();
+                "Ok()".to_string()
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log_fs!(
+            fs,
+            self.user_id,
+            "RMDIR parent={}, name={:?} |> {}",
+            parent,
+            name,
+            res
+        );
     }
 
     fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-        log::debug!("ACCESS: ino={}, mask={:o}", ino, mask);
-
         let sieve_mask = |m: i32, ret: u8| {
             if m & mask > 0 {
                 ret
@@ -638,9 +803,49 @@ impl fuser::Filesystem for FsSession {
             | sieve_mask(libc::W_OK, WRITE)
             | sieve_mask(libc::X_OK, EXEC);
 
-        match self.lock().check_access(self.user_id, ino, mask) {
-            Ok(_) => reply.ok(),
-            Err(err) => reply.error(err),
+        let fs = self.lock();
+
+        let res = match fs.check_access(self.user_id, ino, mask) {
+            Ok(_) => {
+                reply.ok();
+                "Ok()".to_string()
+            }
+            Err(err) => {
+                reply.error(err);
+                format!("Err({})", Errno::from_i32(err))
+            }
+        };
+
+        log::debug!("ACCESS ino={} mask={:o} |> {}", ino, mask, res);
+    }
+}
+
+struct DisplayIfSome<'a, N, T>(N, &'a Option<T>);
+
+impl<'a, N, T> std::fmt::Debug for DisplayIfSome<'a, N, T>
+where
+    N: Display,
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(t) = &self.1 {
+            write!(f, " {}={:?}", self.0, t)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<'a, N, T> Display for DisplayIfSome<'a, N, T>
+where
+    N: Display,
+    T: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(t) = &self.1 {
+            write!(f, " {}={}", self.0, t)
+        } else {
+            Ok(())
         }
     }
 }

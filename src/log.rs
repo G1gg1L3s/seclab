@@ -146,7 +146,7 @@ impl Logger {
         ))
     }
 
-    pub fn into_receiver(self) -> (ArcLogger, LogReceiver, Sender<Log>) {
+    pub fn into_receiver(self) -> (ArcLogger, LogReceiver, LogSender) {
         let arc_logger = Arc::new(Mutex::new(self));
         let (recv, sender) = LogReceiver::new(arc_logger.clone());
         (arc_logger, recv, sender)
@@ -154,6 +154,7 @@ impl Logger {
 }
 
 pub type ArcLogger = Arc<Mutex<Logger>>;
+pub type LogSender = Sender<Log>;
 
 pub struct LogReceiver {
     logger: ArcLogger,

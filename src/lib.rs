@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::log::{ArcLogger, EncLogs, LogHandler, Logger};
 use anyhow::anyhow;
 use crypto::{PrivateKey, PublicKey};
-use fs::{Fs, FsSession};
+use fs::{Fs, FsImage, FsSession};
 use serde::{Deserialize, Serialize};
 use user::{UserId, UserManager};
 
@@ -17,8 +17,7 @@ pub mod user;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SystemImage {
     users: UserManager,
-    fs: Fs,
-    //TODO: find out how to launch logger
+    fs: FsImage,
     logs: EncLogs,
 }
 
@@ -35,7 +34,7 @@ impl SystemImage {
 
         Ok(System {
             users: self.users,
-            fs: Arc::new(Mutex::new(self.fs)),
+            fs: Arc::new(Mutex::new(self.fs.unpack(sender))),
             log_handler,
             root_key,
             logger,
@@ -93,19 +92,9 @@ impl System {
         let (logger, logrecv, sender) = Logger::new(root_key.clone()).into_receiver();
         let log_handler = logrecv.start();
 
-        // TODO: remove debug
-        std::thread::spawn(move || {
-            for i in 0..5 {
-                sender
-                    .send(crate::log::Log::new(root_id, format!("Boop #{}", i)))
-                    .unwrap();
-                std::thread::sleep(std::time::Duration::new(1, 0));
-            }
-        });
-
         Self {
             users,
-            fs: Arc::new(Mutex::new(Fs::new(root_id))),
+            fs: Arc::new(Mutex::new(Fs::new(root_id, sender))),
             log_handler,
             root_key,
             logger,
@@ -123,13 +112,19 @@ impl System {
     pub fn pack(self) -> PackResult {
         match Arc::try_unwrap(self.fs) {
             Ok(fs) => {
+                // It's important to destroy the filesystem first, so it drops the
+                // log sender, which would unblock the logger
+                let fs = fs
+                    .into_inner()
+                    .expect("no one is holding the mutext")
+                    .pack();
                 let logs = match self.log_handler.join().expect("log thread panicked") {
                     Ok(_) => self.logger.lock().expect("locking the logger").logs(),
                     Err(err) => return PackResult::Err(err),
                 };
                 PackResult::Ok(SystemImage {
                     users: self.users,
-                    fs: fs.into_inner().expect("no one is holding a mutex"),
+                    fs,
                     logs,
                 })
             }
@@ -199,7 +194,6 @@ impl SystemSession {
             .expect("locking the logger")
             .decrypt_logs(&self.user_key)?;
 
-        // TODO: wrap into type with Display
         Ok(logs.to_string())
     }
 }

@@ -107,6 +107,7 @@ pub struct User {
     pass_hash: String,
     private_key: EncryptedPrivateKey,
     public_key: PublicKey,
+    locked: bool,
 }
 
 impl User {
@@ -120,6 +121,7 @@ impl User {
             pass_hash,
             private_key,
             public_key,
+            locked: false,
         })
     }
 
@@ -133,7 +135,8 @@ pub type UserId = u64;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UserManager {
     user_ctr: UserId,
-    users: HashMap<Username, User>,
+    usernames: HashMap<String, UserId>,
+    users: HashMap<UserId, User>,
 }
 
 impl UserManager {
@@ -146,18 +149,34 @@ impl UserManager {
             anyhow::bail!("Max number of users is already registered");
         }
 
-        if self.users.get(&username).is_some() {
+        if self.usernames.get(&username).is_some() {
             anyhow::bail!("the user already exists")
         }
         let id = self.user_ctr;
         self.user_ctr += 1;
         let user = User::new(id, username.clone(), &password)?;
-        self.users.insert(username, user);
+        self.usernames.insert(username, id);
+        self.users.insert(id, user);
         Ok(id)
     }
 
     pub fn login(&self, username: &str, password: &str) -> anyhow::Result<(UserId, PrivateKey)> {
-        if let Some(user) = self.users.get(username) {
+        if let Some(uid) = self.usernames.get(username).copied() {
+            self.login_with_uid(uid, password)
+        } else {
+            anyhow::bail!("Wrong username or password")
+        }
+    }
+
+    pub fn login_with_uid(
+        &self,
+        uid: UserId,
+        password: &str,
+    ) -> anyhow::Result<(UserId, PrivateKey)> {
+        if let Some(user) = self.users.get(&uid) {
+            if user.locked {
+                anyhow::bail!("User is locker. Contact root to unlock the account")
+            }
             if user.check_pass(password).is_ok() {
                 let key = user.private_key.clone().decrypt(password)?;
                 return Ok((user.id, key));
@@ -167,12 +186,31 @@ impl UserManager {
     }
 
     pub fn get_id_for(&self, user: &str) -> Option<UserId> {
-        self.users.get(user).map(|u| u.id)
+        self.usernames.get(user).copied()
     }
 
     // TODO: probably should accept uid
     pub fn get_public_key_for(&self, user: &str) -> Option<&PublicKey> {
-        self.users.get(user).map(|user| &user.public_key)
+        self.usernames
+            .get(user)
+            .and_then(|id| self.users.get(id).map(|user| &user.public_key))
+    }
+
+    pub fn unlock(&mut self, user: &str) -> anyhow::Result<()> {
+        let doesnt_exist = || anyhow::anyhow!("User doesn't exist");
+
+        let uid = self.usernames.get(user).ok_or_else(doesnt_exist)?;
+        let user = self.users.get_mut(uid).ok_or_else(doesnt_exist)?;
+        user.locked = false;
+        Ok(())
+    }
+
+    pub fn lock(&mut self, uid: UserId) -> anyhow::Result<()> {
+        let doesnt_exist = || anyhow::anyhow!("User doesn't exist");
+
+        let user = self.users.get_mut(&uid).ok_or_else(doesnt_exist)?;
+        user.locked = true;
+        Ok(())
     }
 }
 

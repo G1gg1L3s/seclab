@@ -164,6 +164,18 @@ impl SystemSession {
         self.sys
     }
 
+    pub fn validate_password(&mut self, pass: &str) -> anyhow::Result<()> {
+        self.sys.users.login_with_uid(self.user_id, pass)?;
+        Ok(())
+    }
+
+    pub fn unlock(&mut self, name: &str) -> anyhow::Result<()> {
+        if self.user_id != self.root_id {
+            anyhow::bail!("only root can unlock the account")
+        }
+        self.sys.users.unlock(name)
+    }
+
     pub fn useradd(&mut self, username: String) -> anyhow::Result<()> {
         if self.user_id == self.root_id {
             self.sys.users.new_user(username, "".into())?;
@@ -215,5 +227,13 @@ impl SystemSession {
             .decrypt_logs(&self.user_key)?;
 
         Ok(logs.to_string())
+    }
+
+    pub fn get_fs(&self) -> Arc<Mutex<Fs>> {
+        self.sys.fs.clone()
+    }
+
+    pub fn lock(&mut self) -> anyhow::Result<()> {
+        self.sys.users.lock(self.user_id)
     }
 }

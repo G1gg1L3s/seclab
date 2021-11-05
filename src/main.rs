@@ -1,8 +1,13 @@
-use std::io::{ErrorKind, Write};
+use std::{
+    io::{stdout, ErrorKind, Write},
+    time::Duration,
+};
 
+use futures::executor::block_on;
 use seclab::{System, SystemImage, SystemSession};
-use shrust::{ExecError, Shell, ShellIO};
 use structopt::StructOpt;
+
+const PASSWORD_TRIES: usize = 3;
 
 #[derive(StructOpt)]
 struct Opt {
@@ -14,6 +19,9 @@ struct Opt {
 
     #[structopt(short, long)]
     debug: bool,
+
+    #[structopt(short, long, default_value = "60")]
+    timeout: u64,
 }
 
 fn fix_newline(str: &mut String) {
@@ -30,58 +38,60 @@ fn read_credentials() -> anyhow::Result<(String, String)> {
     std::io::stdout().flush()?;
     let mut username = String::new();
     std::io::stdin().read_line(&mut username)?;
-    print!("Password: ");
-    std::io::stdout().flush()?;
-    let password = rpassword::read_password()?;
     fix_newline(&mut username);
+    let password = read_password()?;
     Ok((username, password))
 }
 
-trait IntoExecError<T> {
-    fn into_exec_err(self) -> Result<T, ExecError>;
+fn read_password() -> anyhow::Result<String> {
+    print!("Password: ");
+    std::io::stdout().flush()?;
+    rpassword::read_password().map_err(Into::into)
 }
 
-impl<T> IntoExecError<T> for anyhow::Result<T> {
-    fn into_exec_err(self) -> Result<T, ExecError> {
-        self.map_err(|err| ExecError::Other(err.into()))
+async fn start_shell(timeout: Duration, sys: &mut SystemSession) -> bool {
+    let f = async_std::io::timeout(timeout, async {
+        let mut line = String::new();
+
+        loop {
+            print!("> ");
+            stdout().flush().unwrap();
+            async_std::io::stdin().read_line(&mut line).await.unwrap();
+            let exit = exec_cmd(sys, &line);
+            line.clear();
+            if exit {
+                return Ok(true);
+            }
+        }
+    })
+    .await;
+
+    match f {
+        Ok(t) => t,
+        Err(_) => {
+            println!("timeout: you need to login again");
+            false
+        }
     }
 }
 
-fn create_shell(data: &mut SystemSession) -> Shell<&mut SystemSession> {
-    let mut shell = Shell::new(data);
-    shell.new_command_noargs("exit", "Stop the filesystem server", |_, _| {
-        Err(ExecError::Quit)
-    });
+fn exec_cmd(sys: &mut SystemSession, line: &str) -> bool {
+    let cmd = line.split_whitespace().collect::<Vec<_>>();
 
-    shell.new_command(
-        "useradd",
-        "Add new user to the system",
-        1,
-        |_, sys, args| {
-            let username = args[0];
-            sys.useradd(username.into()).into_exec_err()
-        },
-    );
+    let res = match cmd.as_slice() {
+        [] => return false,
+        ["exit"] => return true,
+        ["useradd", name] => sys.useradd(name.to_string()),
+        ["permadd", user, perm, path] => sys.add_perm(user, perm, path),
+        ["logs"] => sys.logs().map(|logs| print!("{}", logs)),
+        ["unlock", name] => sys.unlock(name),
+        [cmd, ..] => Err(anyhow::anyhow!("Unknown command: {}", cmd)),
+    };
 
-    shell.new_command(
-        "permadd",
-        "Add permissions to the file",
-        3,
-        |_, sys, args| {
-            let user = args[0];
-            let perm = args[1];
-            let path = args[2];
-            sys.add_perm(user, perm, path).into_exec_err()
-        },
-    );
-
-    shell.new_command_noargs("logs", "Show logs", |io, sys| {
-        let logs = sys.logs().into_exec_err()?;
-        io.write_all(logs.as_bytes())?;
-        Ok(())
-    });
-
-    shell
+    if let Err(err) = res {
+        println!("Error: {}", err);
+    }
+    false
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,10 +124,34 @@ fn main() -> anyhow::Result<()> {
     }
 
     let handler = fs.run(&opt.mountpoint)?;
+    let timeout = Duration::new(opt.timeout, 0);
 
-    {
-        let mut shell = create_shell(&mut sys);
-        shell.run_loop(&mut ShellIO::default());
+    'outer: loop {
+        let exit = block_on(start_shell(timeout, &mut sys));
+        if exit {
+            break;
+        }
+
+        let fs = sys.get_fs();
+        let _locker = fs.lock().expect("error locking the fs");
+
+        let mut counter = 0;
+        loop {
+            let pass = read_password()?;
+            match sys.validate_password(&pass) {
+                Ok(_) => continue 'outer,
+                Err(err) => {
+                    println!("[{}/{}]: Error: {}", counter + 1, PASSWORD_TRIES, err);
+                    counter += 1
+                }
+            }
+
+            if counter == PASSWORD_TRIES {
+                println!("{} incorrect password attempts, locking", counter);
+                sys.lock()?;
+                break 'outer;
+            }
+        }
     }
 
     handler.join();

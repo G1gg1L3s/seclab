@@ -39,12 +39,12 @@ fn read_credentials() -> anyhow::Result<(String, String)> {
     let mut username = String::new();
     std::io::stdin().read_line(&mut username)?;
     fix_newline(&mut username);
-    let password = read_password()?;
+    let password = read_password("Password")?;
     Ok((username, password))
 }
 
-fn read_password() -> anyhow::Result<String> {
-    print!("Password: ");
+fn read_password(prefix: &str) -> anyhow::Result<String> {
+    print!("{}: ", prefix);
     std::io::stdout().flush()?;
     rpassword::read_password().map_err(Into::into)
 }
@@ -85,6 +85,7 @@ fn exec_cmd(sys: &mut SystemSession, line: &str) -> bool {
         ["permadd", user, perm, path] => sys.add_perm(user, perm, path),
         ["logs"] => sys.logs().map(|logs| print!("{}", logs)),
         ["unlock", name] => sys.unlock(name),
+        ["chpass"] => chpass(sys),
         [cmd, ..] => Err(anyhow::anyhow!("Unknown command: {}", cmd)),
     };
 
@@ -92,6 +93,17 @@ fn exec_cmd(sys: &mut SystemSession, line: &str) -> bool {
         println!("Error: {}", err);
     }
     false
+}
+
+fn chpass(sys: &mut SystemSession) -> anyhow::Result<()> {
+    let actual_pass = read_password("Enter current password")?;
+    let new_pass = read_password("Enter new password")?;
+    let new_pass_again = read_password("Enter new password again")?;
+    if new_pass != new_pass_again {
+        anyhow::bail!("password don't match");
+    }
+
+    sys.chpass(&actual_pass, &new_pass)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -137,7 +149,7 @@ fn main() -> anyhow::Result<()> {
 
         let mut counter = 0;
         loop {
-            let pass = read_password()?;
+            let pass = read_password("Enter password again")?;
             match sys.validate_password(&pass) {
                 Ok(_) => continue 'outer,
                 Err(err) => {

@@ -160,7 +160,7 @@ impl System {
 
 impl SystemSession {
     pub fn logout(self) -> System {
-        self.sys.log_sender.send_log(self.user_id, "logout");
+        self.log("logout");
         self.sys
     }
 
@@ -235,5 +235,24 @@ impl SystemSession {
 
     pub fn lock(&mut self) -> anyhow::Result<()> {
         self.sys.users.lock(self.user_id)
+    }
+
+    pub fn chpass(&mut self, current: &str, new: &str) -> anyhow::Result<()> {
+        let result = (|| {
+            self.validate_password(current)?;
+            self.sys.users.set_pass(self.user_id, current, new)
+        })();
+
+        let res = match &result {
+            Ok(_) => "Ok()".to_string(),
+            Err(err) => format!("Err({})", err),
+        };
+
+        self.log(format!("chpass |> {}", res));
+        result
+    }
+
+    pub fn log(&self, msg: impl Into<String>) {
+        self.sys.log_sender.send_log(self.user_id, msg);
     }
 }

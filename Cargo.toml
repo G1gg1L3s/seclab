@@ -24,3 +24,4 @@ serde = { version = "1.0.130", features = ["derive"] }
 structopt = "0.3.23"
 themis = { git = "https://github.com/cossacklabs/themis/" }
 time = { version = "0.3.4", features = ["formatting", "std", "serde"] }
+zxcvbn = "2.1.2"

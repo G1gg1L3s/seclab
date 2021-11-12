@@ -110,6 +110,20 @@ pub struct User {
     locked: bool,
 }
 
+const MIN_PASS_LEN: usize = 6;
+
+fn validate_password(pass: &str) -> anyhow::Result<()> {
+    if pass.len() <= MIN_PASS_LEN {
+        anyhow::bail!("password is too short");
+    }
+    let score = zxcvbn::zxcvbn(pass, &[])?.score();
+    if score < 3 {
+        anyhow::bail!("password is too weak")
+    } else {
+        Ok(())
+    }
+}
+
 impl User {
     pub fn new(id: UserId, username: Username, password: &str) -> anyhow::Result<Self> {
         let (private_key, public_key) = crypto::gen_keypair();
@@ -127,6 +141,15 @@ impl User {
 
     pub fn check_pass(&self, pass: &str) -> anyhow::Result<()> {
         crypto::verify_password(&self.pass_hash, pass)
+    }
+
+    pub fn set_pass(&mut self, old_pass: &str, pass: &str) -> anyhow::Result<()> {
+        validate_password(pass)?;
+        let pass_hash = crypto::new_password_hash(pass)?;
+        self.pass_hash = pass_hash;
+        let private_key = self.private_key.clone().decrypt(old_pass)?;
+        self.private_key = private_key.encrypt(pass)?;
+        Ok(())
     }
 }
 
@@ -211,6 +234,15 @@ impl UserManager {
         let user = self.users.get_mut(&uid).ok_or_else(doesnt_exist)?;
         user.locked = true;
         Ok(())
+    }
+
+    pub fn set_pass(&mut self, uid: UserId, old_pass: &str, pass: &str) -> anyhow::Result<()> {
+        let user = self
+            .users
+            .get_mut(&uid)
+            .ok_or_else(|| anyhow::anyhow!("user not found"))?;
+
+        user.set_pass(old_pass, pass)
     }
 }
 

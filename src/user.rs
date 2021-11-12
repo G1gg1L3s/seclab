@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto;
+use crate::crypto::{self, EncryptedPrivateKey, PrivateKey, PublicKey};
 
 const MAX_USER_COUNT: usize = 16;
 
@@ -105,15 +105,21 @@ pub struct User {
     id: UserId,
     username: Username,
     pass_hash: String,
+    private_key: EncryptedPrivateKey,
+    public_key: PublicKey,
 }
 
 impl User {
     pub fn new(id: UserId, username: Username, password: &str) -> anyhow::Result<Self> {
+        let (private_key, public_key) = crypto::gen_keypair();
+        let private_key = private_key.encrypt(password)?;
         let pass_hash = crypto::new_password_hash(password)?;
         Ok(Self {
             id,
             username,
             pass_hash,
+            private_key,
+            public_key,
         })
     }
 
@@ -150,21 +156,23 @@ impl UserManager {
         Ok(id)
     }
 
-    pub fn login(&self, username: &str, password: &str) -> anyhow::Result<UserId> {
-        self.users
-            .get(username)
-            .and_then(|user| {
-                if user.check_pass(password).is_ok() {
-                    Some(user.id)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("Wrong username or password"))
+    pub fn login(&self, username: &str, password: &str) -> anyhow::Result<(UserId, PrivateKey)> {
+        if let Some(user) = self.users.get(username) {
+            if user.check_pass(password).is_ok() {
+                let key = user.private_key.clone().decrypt(password)?;
+                return Ok((user.id, key));
+            }
+        }
+        anyhow::bail!("Wrong username or password")
     }
 
     pub fn get_id_for(&self, user: &str) -> Option<UserId> {
         self.users.get(user).map(|u| u.id)
+    }
+
+    // TODO: probably should accept uid
+    pub fn get_public_key_for(&self, user: &str) -> Option<&PublicKey> {
+        self.users.get(user).map(|user| &user.public_key)
     }
 }
 

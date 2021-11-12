@@ -75,6 +75,12 @@ fn create_shell(data: &mut SystemSession) -> Shell<&mut SystemSession> {
         },
     );
 
+    shell.new_command_noargs("logs", "Show logs", |io, sys| {
+        let logs = sys.logs().into_exec_err()?;
+        io.write_all(logs.as_bytes())?;
+        Ok(())
+    });
+
     shell
 }
 
@@ -91,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     let system = match std::fs::File::open(&opt.image) {
         Ok(file) => {
             let img: SystemImage = bincode::deserialize_from(file)?;
-            img.unpack()
+            img.unpack()?
         }
         Err(err) if err.kind() == ErrorKind::NotFound => System::new(),
         Err(err) => return Err(err.into()),
@@ -116,12 +122,11 @@ fn main() -> anyhow::Result<()> {
 
     handler.join();
 
-    let image = sys
-        .logout()
-        .pack()
-        // TODO: proper error handling
-        .map_err(|_| anyhow::anyhow!("there should be no more handlers"))?;
-
+    let image = match sys.logout().pack() {
+        seclab::PackResult::Ok(image) => image,
+        seclab::PackResult::Err(err) => return Err(err),
+        seclab::PackResult::UnwrapErr(_) => unreachable!("there are no other threads"),
+    };
     let file = std::fs::File::create(opt.image)?;
     bincode::serialize_into(file, &image)?;
 

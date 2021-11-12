@@ -5,7 +5,7 @@ use std::{
     fmt::{Debug, Display},
     path::{Component, Path},
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, SystemTimeError},
 };
 
 use anyhow::anyhow;
@@ -172,6 +172,7 @@ pub struct Fs {
     inodes: HashMap<Id, Inode>,
     inode_ctr: u64,
     logger: LogSender,
+    last_access: SystemTime,
 }
 
 impl FsImage {
@@ -181,6 +182,7 @@ impl FsImage {
             inodes,
             inode_ctr,
             logger,
+            last_access: SystemTime::now(),
         }
     }
 }
@@ -207,6 +209,7 @@ impl Fs {
             inode_ctr: 2,
             inodes,
             logger,
+            last_access: SystemTime::now(),
         }
     }
 
@@ -215,6 +218,7 @@ impl Fs {
             inodes,
             inode_ctr,
             logger: _,
+            last_access: _,
         } = self;
         FsImage { inodes, inode_ctr }
     }
@@ -413,6 +417,10 @@ impl Fs {
             .map_err(|_| anyhow!("file not found"))?;
         inode.perm.entry(uid).or_default().add(perm);
         Ok(())
+    }
+
+    pub fn elapsed(&self) -> Result<Duration, SystemTimeError> {
+        self.last_access.elapsed()
     }
 }
 

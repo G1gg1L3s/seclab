@@ -49,7 +49,12 @@ fn read_password(prefix: &str) -> anyhow::Result<String> {
     rpassword::read_password().map_err(Into::into)
 }
 
-async fn start_shell(timeout: Duration, sys: &mut SystemSession) -> bool {
+enum ShellRes {
+    Timeout,
+    Exit,
+}
+
+async fn start_shell(timeout: Duration, sys: &mut SystemSession) -> ShellRes {
     let f = async_std::io::timeout(timeout, async {
         let mut line = String::new();
 
@@ -60,17 +65,17 @@ async fn start_shell(timeout: Duration, sys: &mut SystemSession) -> bool {
             let exit = exec_cmd(sys, &line);
             line.clear();
             if exit {
-                return Ok(true);
+                return Ok(());
             }
         }
     })
     .await;
 
     match f {
-        Ok(t) => t,
+        Ok(()) => ShellRes::Exit,
         Err(_) => {
             println!("timeout: you need to login again");
-            false
+            ShellRes::Timeout
         }
     }
 }
@@ -139,13 +144,24 @@ fn main() -> anyhow::Result<()> {
     let timeout = Duration::new(opt.timeout, 0);
 
     'outer: loop {
-        let exit = block_on(start_shell(timeout, &mut sys));
-        if exit {
-            break;
-        }
+        // Default timeout, for which if user is innactive, system is logouting
+        let innactive_timeout: Duration = Duration::new(60, 0);
 
+        let result = block_on(start_shell(timeout, &mut sys));
+        if let ShellRes::Exit = result {
+            break 'outer;
+        }
         let fs = sys.get_fs();
-        let _locker = fs.lock().expect("error locking the fs");
+        let locker = fs.lock().expect("error locking the fs");
+
+        match locker.elapsed() {
+            Ok(duration) if duration < innactive_timeout => {}
+            _ => {
+                println!("logouting due to inactivity");
+                sys.log("logouting due to inactivity");
+                break 'outer;
+            }
+        }
 
         let mut counter = 0;
         loop {

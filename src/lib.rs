@@ -160,8 +160,20 @@ impl System {
 
 impl SystemSession {
     pub fn logout(self) -> System {
-        self.sys.log_sender.send_log(self.user_id, "logout");
+        self.log("logout");
         self.sys
+    }
+
+    pub fn validate_password(&mut self, pass: &str) -> anyhow::Result<()> {
+        self.sys.users.login_with_uid(self.user_id, pass)?;
+        Ok(())
+    }
+
+    pub fn unlock(&mut self, name: &str) -> anyhow::Result<()> {
+        if self.user_id != self.root_id {
+            anyhow::bail!("only root can unlock the account")
+        }
+        self.sys.users.unlock(name)
     }
 
     pub fn useradd(&mut self, username: String) -> anyhow::Result<()> {
@@ -215,5 +227,32 @@ impl SystemSession {
             .decrypt_logs(&self.user_key)?;
 
         Ok(logs.to_string())
+    }
+
+    pub fn get_fs(&self) -> Arc<Mutex<Fs>> {
+        self.sys.fs.clone()
+    }
+
+    pub fn lock(&mut self) -> anyhow::Result<()> {
+        self.sys.users.lock(self.user_id)
+    }
+
+    pub fn chpass(&mut self, current: &str, new: &str) -> anyhow::Result<()> {
+        let result = (|| {
+            self.validate_password(current)?;
+            self.sys.users.set_pass(self.user_id, current, new)
+        })();
+
+        let res = match &result {
+            Ok(_) => "Ok()".to_string(),
+            Err(err) => format!("Err({})", err),
+        };
+
+        self.log(format!("chpass |> {}", res));
+        result
+    }
+
+    pub fn log(&self, msg: impl Into<String>) {
+        self.sys.log_sender.send_log(self.user_id, msg);
     }
 }
